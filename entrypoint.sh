@@ -39,12 +39,6 @@ validate_args() {
     wait_workflow=${INPUT_WAIT_WORKFLOW}
   fi
 
-  last_workflow_interval=0
-  if [ -n "${INPUT_LAST_WORKFLOW_INTERVAL}" ]
-  then
-    last_workflow_interval=${INPUT_LAST_WORKFLOW_INTERVAL}
-  fi
-
   if [ -z "${INPUT_OWNER}" ]
   then
     echo "Error: Owner is a required argument."
@@ -75,10 +69,10 @@ validate_args() {
     exit 1
   fi
 
-  client_payload=$(echo '{}' | jq)
+  client_payload=$(echo '{}' | jq -c)
   if [ "${INPUT_CLIENT_PAYLOAD}" ]
   then
-    client_payload=$(echo "${INPUT_CLIENT_PAYLOAD}" | jq)
+    client_payload=$(echo "${INPUT_CLIENT_PAYLOAD}" | jq -c)
   fi
 
   ref="main"
@@ -86,6 +80,11 @@ validate_args() {
   then
     ref="${INPUT_REF}"
   fi
+}
+
+lets_wait() {
+  echo "Sleeping for ${wait_interval} seconds"
+  sleep "$wait_interval"
 }
 
 api() {
@@ -102,8 +101,18 @@ api() {
     echo >&2 "api failed:"
     echo >&2 "path: $path"
     echo >&2 "response: $response"
-    exit 1
+    if [[ "$response" == *'"Server Error"'* ]]; then 
+      echo "Server error - trying again"
+    else
+      exit 1
+    fi
   fi
+}
+
+lets_wait() {
+  local interval=${1:-$wait_interval}
+  echo >&2 "Sleeping for $interval seconds"
+  sleep "$interval"
 }
 
 # Return the ids of the most recent workflow runs, optionally filtered by user
@@ -115,7 +124,7 @@ get_workflow_runs() {
   echo "Getting workflow runs using query: ${query}" >&2
 
   api "workflows/${INPUT_WORKFLOW_FILE_NAME}/runs?${query}" |
-  jq '.workflow_runs[].id' |
+  jq -r '.workflow_runs[].id' |
   sort # Sort to ensure repeatable order, and lexicographically for compatibility with join
 }
 
@@ -135,13 +144,25 @@ trigger_workflow() {
   NEW_RUNS=$OLD_RUNS
   while [ "$NEW_RUNS" = "$OLD_RUNS" ]
   do
-    echo >&2 "Sleeping for ${wait_interval} seconds"
-    sleep "$wait_interval"
+    lets_wait
     NEW_RUNS=$(get_workflow_runs "$SINCE")
   done
 
   # Return new run ids
   join -v2 <(echo "$OLD_RUNS") <(echo "$NEW_RUNS")
+}
+
+comment_downstream_link() {
+  if response=$(curl --fail-with-body -sSL -X POST \
+      "${INPUT_COMMENT_DOWNSTREAM_URL}" \
+      -H "Authorization: Bearer ${INPUT_COMMENT_GITHUB_TOKEN}" \
+      -H 'Accept: application/vnd.github.v3+json' \
+      -d "{\"body\": \"Running downstream job at $1\"}")
+  then
+    echo "$response"
+  else
+    echo >&2 "failed to comment to ${INPUT_COMMENT_DOWNSTREAM_URL}:"
+  fi
 }
 
 wait_for_workflow_to_finish() {
@@ -155,13 +176,16 @@ wait_for_workflow_to_finish() {
   echo "workflow_url=${last_workflow_url}" >> $GITHUB_OUTPUT
   echo ""
 
+  if [ -n "${INPUT_COMMENT_DOWNSTREAM_URL}" ]; then
+    comment_downstream_link ${last_workflow_url}
+  fi
+
   conclusion=null
   status=
 
   while [[ "${conclusion}" == "null" && "${status}" != "completed" ]]
   do
-    echo "Sleeping for \"${wait_interval}\" seconds"
-    sleep "${wait_interval}"
+    lets_wait
 
     workflow=$(api "runs/$last_workflow_id")
     conclusion=$(echo "${workflow}" | jq -r '.conclusion')
@@ -169,6 +193,7 @@ wait_for_workflow_to_finish() {
 
     echo "Checking conclusion [${conclusion}]"
     echo "Checking status [${status}]"
+    echo "conclusion=${conclusion}" >> $GITHUB_OUTPUT
   done
 
   if [[ "${conclusion}" == "success" && "${status}" == "completed" ]]
